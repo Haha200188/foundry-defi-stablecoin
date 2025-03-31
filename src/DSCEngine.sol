@@ -32,9 +32,11 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine_NeedsMoreThanZero();
     error DSCEngine_TokenAddressesAndPriceFeedAddressesAmountDontMatch();
     error DSCEngine_TokenNotAllowed(address token);
-    error DSCEngine_TransferFailed(address from, address to, address token, uint256 value);
+    error DSCEngine_TransferFailed();
     error DSCEngine_BreaksHealthFactor(address user, uint256 healthFactor);
     error DSCEngine_MintFailed();
+    error DSCEngine_Underflow();
+    error DSCEngine_WillBreaksHealthFactorAfterRedeem(address user, uint256 healthFactorAfterRedeem);
 
     ///////////////////
     // State Variables
@@ -107,11 +109,15 @@ contract DSCEngine is ReentrancyGuard {
         // total DSC minted
         // total collateral VALUE
         (uint256 totalDscMinted, uint256 collateralValueInUsd) = _getAccountInformation(user);
+        if (totalDscMinted == 0) {
+            return type(uint256).max;
+        }
         // For example:
         // 1500 ETH, 1000 DSC
         // 1500 * 50 / 100 = 750
         // 750 / 1000 = 0.75 < 1
-        return ((((collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION) * PRECISION) / totalDscMinted);
+        return (collateralValueInUsd * LIQUIDATION_THRESHOLD * PRECISION / (totalDscMinted * LIQUIDATION_PRECISION)); // avoid consecutive divisions that affect precision
+            //return ((((collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION) * PRECISION) / totalDscMinted);
     }
 
     function _revertIfHealthFactorIsBroken(address user) internal view {
@@ -121,6 +127,24 @@ contract DSCEngine is ReentrancyGuard {
         if (userHealthFactor < MIN_HEALTH_FACTOR) {
             revert DSCEngine_BreaksHealthFactor(user, userHealthFactor);
         }
+    }
+
+    function _calculateHealthFactorAfterRedeem(address user, address tokenCollateralRedeem, uint256 amountRedeem)
+        private
+        view
+        returns (uint256)
+    {
+        // total DSC minted
+        // total collateral VALUE
+        (uint256 totalDscMinted, uint256 collateralValueInUsd) = _getAccountInformation(user);
+        if (totalDscMinted == 0) {
+            return type(uint256).max;
+        }
+        uint256 redeemValueInUsd = getUsdValue(tokenCollateralRedeem, amountRedeem);
+        return (
+            (collateralValueInUsd - redeemValueInUsd) * LIQUIDATION_THRESHOLD * PRECISION
+                / (totalDscMinted * LIQUIDATION_PRECISION)
+        );
     }
 
     ///////////////////
@@ -139,13 +163,29 @@ contract DSCEngine is ReentrancyGuard {
     ///////////////////
     // External & Public Functions
     ///////////////////
+
+    /**
+     * @notice this function will deposit your collateral and mint dsc
+     * @param tokenCollateralAddress: The ERC20 token address of collateral you're depositing
+     * @param amountCollateral: The amount of collateral you're depositing
+     * @param amountDscToMint: The amount of dsc you're minting
+     */
+    function depositCollateralAndMintDsc(
+        address tokenCollateralAddress,
+        uint256 amountCollateral,
+        uint256 amountDscToMint
+    ) external {
+        depositCollateral(tokenCollateralAddress, amountCollateral);
+        mintDsc(amountDscToMint);
+    }
+
     /**
      * @notice follows CEI (Checks-Effects-Interactions)
      * @param tokenCollateralAddress: The ERC20 token address of collateral you're depositing
      * @param amountCollateral: The amount of collateral you're depositing
      */
     function depositCollateral(address tokenCollateralAddress, uint256 amountCollateral)
-        external
+        public
         moreThanZero(amountCollateral)
         isAllowedToken(tokenCollateralAddress)
         nonReentrant
@@ -155,7 +195,7 @@ contract DSCEngine is ReentrancyGuard {
 
         bool success = IERC20(tokenCollateralAddress).transferFrom(msg.sender, address(this), amountCollateral);
         if (!success) {
-            revert DSCEngine_TransferFailed(msg.sender, address(this), tokenCollateralAddress, amountCollateral);
+            revert DSCEngine_TransferFailed();
         }
     }
 
@@ -168,7 +208,48 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function redeemCollateral() external {}
+    /**
+     * @notice follows CEI (Checks-Effects-Interactions)
+     * @param tokenCollateralAddress: The ERC20 token address of collateral you're redeeming
+     * @param amountCollateral: The amount of collateral you're redeeming
+     */
+    function redeemCollateral(address tokenCollateralAddress, uint256 amountCollateral)
+        public
+        moreThanZero(amountCollateral)
+        isAllowedToken(tokenCollateralAddress)
+        nonReentrant
+    {
+        // confirm that the user has sufficient collateral
+        if (s_collateralDeposited[msg.sender][tokenCollateralAddress] >= amountCollateral) {
+            revert DSCEngine_Underflow();
+        }
+
+        // confirm that the user’s health factor isn't less than 1(health) after redeem
+        uint256 healthFactorAfterRedeem =
+            _calculateHealthFactorAfterRedeem(msg.sender, tokenCollateralAddress, amountCollateral);
+        if (healthFactorAfterRedeem < MIN_HEALTH_FACTOR) {
+            revert DSCEngine_WillBreaksHealthFactorAfterRedeem(msg.sender, healthFactorAfterRedeem);
+        }
+        s_collateralDeposited[msg.sender][tokenCollateralAddress] -= amountCollateral;
+        emit CollateralRedeemed(msg.sender, tokenCollateralAddress, amountCollateral);
+        bool success = IERC20(tokenCollateralAddress).transfer(msg.sender, amountCollateral);
+        if (!success) {
+            revert DSCEngine_TransferFailed();
+        }
+    }
+
+    function burnDsc(uint256 amount) external moreThanZero(amount) {
+        if (s_DSCMinted[msg.sender] < amount) {
+            revert DSCEngine_Underflow();
+        }
+        s_DSCMinted[msg.sender] -= amount;
+        bool success = IERC20(I_DSC).transferFrom(msg.sender, address(this), amount);
+        if (!success) {
+            revert DSCEngine_TransferFailed();
+        }
+        I_DSC.burn(amount);
+    }
+
     ///////////////////
     // External & Public View & Pure Functions
     ///////////////////
@@ -191,5 +272,13 @@ contract DSCEngine is ReentrancyGuard {
         // Most USD pairs have 8 decimals, so we will just pretend they all do
         // We want to have everything in terms of WEI, so we add 10 zeros at the end
         return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION;
+    }
+
+    ///////////////////
+    // Getter Functions
+    ///////////////////
+
+    function getPriceFeed(address token) public view returns (address) {
+        return s_priceFeed[token];
     }
 }
